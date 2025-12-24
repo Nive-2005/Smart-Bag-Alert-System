@@ -1,0 +1,237 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ======= Pin Configuration =======
+#define SS_PIN     21
+#define RST_PIN    22
+#define GREEN_LED  2
+#define RED_LED    4
+#define BTN_PIN    15  // optional button                                                                                                                                                                                         
+
+MFRC522 rfid(SS_PIN, RST_PIN);  
+
+// ======= WiFi & Telegram =======
+const char* ssid = "------";         // <<< REPLACE with your WiFi SSID
+const char* password = "------"; // <<< REPLACE with your WiFi password
+
+// From your BotFather message (already provided by you)
+const char* telegramBotToken = "-------"; 
+const char* chatID = "-------"; // your chat id
+
+// ======= Book Tag UIDs =======
+const String TAG1_UID = "00:00:00:00";  // Maths book
+const String TAG2_UID = "00:00:00:00";  // Science book
+
+// ======= Timing =======
+unsigned long lastSeenTag1 = 0;
+unsigned long lastSeenTag2 = 0;
+const unsigned long PRESENCE_TIMEOUT = 2000; // ms
+
+// blink control
+unsigned long previousMillis = 0;
+const unsigned long blinkIntervalOneMissing = 400;
+const unsigned long blinkIntervalBothMissing = 200;
+
+// Telegram message cooldown
+unsigned long lastTelegramTime = 0;
+const unsigned long TELEGRAM_COOLDOWN = 10000; // 10 seconds
+
+enum Status { BOTH_PRESENT, ONE_MISSING, BOTH_MISSING };
+Status lastStatus = BOTH_MISSING;
+
+// ======= Helper Functions =======
+String uidToString(MFRC522::Uid &uid) {
+  String s = "";
+  for (byte i = 0; i < uid.size; i++) {
+    if (uid.uidByte[i] < 0x10) s += "0";
+    s += String(uid.uidByte[i], HEX);
+    if (i < uid.size - 1) s += ":";
+  }
+  s.toUpperCase();
+  return s;
+}
+
+// minimal URL-encode for spaces and a few characters
+String simpleUrlEncode(const String &str) {
+  String out = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str[i];
+    if ( (c >= '0' && c <= '9') ||
+         (c >= 'A' && c <= 'Z') ||
+         (c >= 'a' && c <= 'z') ||
+         c == '-' || c == '_' || c == '.' || c == '~' ) {
+      out += c;
+    } else if (c == ' ') {
+      out += "%20";
+    } else {
+      // basic hex encode for other characters
+      char buf[4];
+      sprintf(buf, "%%%02X", (uint8_t)c);
+      out += buf;
+    }
+  }
+  return out;
+}
+
+void sendTelegramMessage(const String &message) {
+  unsigned long now = millis();
+  if (WiFi.status() == WL_CONNECTED && now - lastTelegramTime > TELEGRAM_COOLDOWN) {
+    HTTPClient http;
+    String encoded = simpleUrlEncode(message);
+    String url = "https://api.telegram.org/bot";
+    url += telegramBotToken;
+    url += "/sendMessage?chat_id=";
+    url += chatID;
+    url += "&text=";
+    url += encoded;
+
+    http.begin(url);
+    int httpResponseCode = http.GET();
+    if (httpResponseCode > 0) {
+      Serial.print("Telegram message sent, response code: ");
+      Serial.println(httpResponseCode);
+    } else {
+      Serial.print("Error sending Telegram message: ");
+      Serial.println(httpResponseCode);
+    }
+    http.end();
+    lastTelegramTime = now;
+  } else {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Cannot send Telegram message: WiFi not connected");
+    } else {
+      Serial.println("Telegram message blocked by cooldown");
+    }
+  }
+}
+
+void printStatus(Status s) {
+  if (s == BOTH_PRESENT) {
+    Serial.println("STATUS: BOTH PRESENT -> Green ON, Red OFF");
+  } else if (s == ONE_MISSING) {
+    unsigned long now = millis();
+    bool tag1Present = (now - lastSeenTag1) < PRESENCE_TIMEOUT;
+    bool tag2Present = (now - lastSeenTag2) < PRESENCE_TIMEOUT;
+    if (!tag1Present && tag2Present) Serial.println("STATUS: Maths book (TAG1) MISSING -> Red blink (slow)");
+    else if (tag1Present && !tag2Present) Serial.println("STATUS: Science book (TAG2) MISSING -> Red blink (slow)");
+    else Serial.println("STATUS: ONE MISSING (unknown which) -> Red blink (slow)");
+  } else {
+    Serial.println("STATUS: BOTH MISSING -> Red blink (fast)");
+  }
+}
+
+// ======= Setup =======
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { delay(5); } // wait for serial
+  Serial.println("\n--- Smart Bag Diagnostic Startup ---");
+
+  // connect to WiFi
+  Serial.print("Connecting to WiFi ");
+  Serial.print(ssid);
+  Serial.print(" ");
+  WiFi.begin(ssid, password);
+  int wifiAttempts = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiAttempts < 40) { // about ~20 seconds
+    delay(500);
+    Serial.print(".");
+    wifiAttempts++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to WiFi!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi connection failed - continuing (will retry in background).");
+  }
+
+  // initialize SPI and RFID
+  SPI.begin();
+  rfid.PCD_Init();
+
+  // pin modes
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BTN_PIN, INPUT_PULLUP);
+
+  // turn off initially
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+
+  // LED hardware test
+  Serial.println("LED test: blinking both LEDs 3 times.");
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, HIGH);
+    delay(250);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, LOW);
+    delay(250);
+  }
+  Serial.println("LED test finished. Now running normal operation.");
+}
+
+// ======= Loop =======
+void loop() {
+  // read card if present
+  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+    String found = uidToString(rfid.uid);
+    Serial.print("Read UID: "); Serial.println(found);
+
+    if (found == TAG1_UID) {
+      lastSeenTag1 = millis();
+      Serial.println("-> TAG1 (Maths book) seen");
+    } else if (found == TAG2_UID) {
+      lastSeenTag2 = millis();
+      Serial.println("-> TAG2 (Science book) seen");
+    } else {
+      Serial.println("-> Unknown tag");
+    }
+    rfid.PICC_HaltA();
+  }
+
+  // determine presence
+  unsigned long now = millis();
+  bool tag1Present = (now - lastSeenTag1) < PRESENCE_TIMEOUT;
+  bool tag2Present = (now - lastSeenTag2) < PRESENCE_TIMEOUT;
+
+  Status currentStatus;
+  if (tag1Present && tag2Present) currentStatus = BOTH_PRESENT;
+  else if (tag1Present || tag2Present) currentStatus = ONE_MISSING;
+  else currentStatus = BOTH_MISSING;
+
+  // only act when status changes
+  if (currentStatus != lastStatus) {
+    printStatus(currentStatus);
+
+    // Telegram notifications (only on status change)
+    if (currentStatus == ONE_MISSING) {
+      if (!tag1Present) sendTelegramMessage("⚠ Alert! Maths book missing from bag!");
+      if (!tag2Present) sendTelegramMessage("⚠ Alert! Science book missing from bag!");
+    } else if (currentStatus == BOTH_MISSING) {
+      sendTelegramMessage("⚠ Alert! Both books missing from bag!");
+    } else if (currentStatus == BOTH_PRESENT) {
+      sendTelegramMessage("✅ All books are present in the bag.");
+    }
+
+    lastStatus = currentStatus;
+  }
+
+  // LED control
+  if (currentStatus == BOTH_PRESENT) {
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+  } else {
+    digitalWrite(GREEN_LED, LOW);
+    unsigned long interval = (currentStatus == ONE_MISSING) ? blinkIntervalOneMissing : blinkIntervalBothMissing;
+    if (now - previousMillis >= interval) {
+      previousMillis = now;
+      digitalWrite(RED_LED, !digitalRead(RED_LED)); // toggle red
+    }
+  }
+
+  // small delay to avoid busy loop
+  delay(50);
+}
